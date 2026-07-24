@@ -1,5 +1,7 @@
 # pi-nvim
 
+<!-- Temporary comment -->
+
 Bridge between [pi](https://github.com/badlogic/pi) coding agent and Neovim. Run pi in one terminal pane and Neovim in another — send files, selections, and prompts from Neovim directly into your running pi session.
 
 ![demo](./demo/demo.gif)
@@ -11,7 +13,9 @@ The repo contains two components:
 1. **Pi extension** (`extension.ts`) — opens a unix socket when pi starts. External tools can send JSON messages to inject prompts into the active pi session.
 2. **Neovim plugin** (`lua/pi-nvim/`) — connects to that socket via libuv. Sends context from your editor to pi.
 
-Discovery is automatic: the extension writes socket info to `/tmp/pi-nvim-sockets/`, and the Neovim plugin scans that directory, preferring sessions matching your cwd.
+Discovery is automatic: the extension writes socket info to `/tmp/pi-nvim-sockets/`, and the Neovim plugin scans that directory. It prefers sessions matching the current tmux/Zellij session and working directory, then falls back to the newest live session.
+
+Neovim also publishes a local socket so pi can open files in the matching editor instance.
 
 ## Install
 
@@ -69,6 +73,8 @@ Start pi in one terminal. Start Neovim in another. The pi extension automaticall
 | `:PiSendBuffer` | Send entire buffer + prompt |
 | `:PiPing` | Check if pi is reachable |
 | `:PiSessions` | List/switch between running pi sessions |
+| `/open` (in pi) | Select a file edited by pi and open it in Neovim |
+| `/open path[:line[:column]]` (in pi) | Open a specific location directly in Neovim |
 
 ### Default keybindings
 
@@ -102,6 +108,22 @@ vim.keymap.set("n", "<leader>pb", ":PiSendBuffer<CR>")
 vim.keymap.set("n", "<leader>pi", ":PiPing<CR>")
 ```
 
+## Edited-file tracking
+
+Pi tracks successful uses of its `edit` and `write` tools for the current session. The list is persisted in pi's session entries, so it survives extension reloads and session resume. Running `/open` without arguments shows those files in a TUI selector, most recently edited first.
+
+This practical default intentionally does **not** claim to detect files changed by arbitrary `bash` commands, formatters, generators, or other custom tools. More complete alternatives would be:
+
+- compare VCS/worktree state around each turn;
+- watch filesystem changes while pi is active; or
+- wrap additional mutation tools and report their output paths.
+
+Those options add either overhead or false positives and are not enabled currently.
+
+## Multiplexer matching
+
+Both pi and Neovim publish their working directory and multiplexer identity. Zellij uses `ZELLIJ_SESSION_NAME`. tmux uses `PI_NVIM_TMUX_SESSION` when set, otherwise it queries `tmux display-message -p '#S'` for the session name. Candidates in the same multiplexer session are preferred, with cwd used as an additional match signal.
+
 ## Protocol
 
 The socket accepts newline-delimited JSON:
@@ -109,6 +131,12 @@ The socket accepts newline-delimited JSON:
 ```json
 {"type": "prompt", "message": "your prompt here"}
 {"type": "ping"}
+```
+
+The Neovim-owned socket accepts open requests from pi:
+
+```json
+{"type":"open","path":"/absolute/file.ts","line":42,"column":1}
 ```
 
 Responses:

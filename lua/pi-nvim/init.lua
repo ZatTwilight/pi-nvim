@@ -8,9 +8,88 @@ M.config = {
   set_default_keymaps = true,
 }
 
+M.nvim_server = nil
+M.nvim_socket_path = nil
+M.nvim_info_path = nil
+
+local function get_mux_info()
+  if vim.env.ZELLIJ_SESSION_NAME and vim.env.ZELLIJ_SESSION_NAME ~= "" then
+    return { type = "zellij", session = vim.env.ZELLIJ_SESSION_NAME }
+  end
+  if vim.env.TMUX and vim.env.TMUX ~= "" then
+    local session = vim.env.PI_NVIM_TMUX_SESSION
+    if not session or session == "" then
+      local result = vim.fn.system({ "tmux", "display-message", "-p", "#S" })
+      if vim.v.shell_error == 0 then session = vim.trim(result) end
+    end
+    return { type = "tmux", session = session or vim.env.TMUX:match("^[^,]+") }
+  end
+  return vim.NIL
+end
+
+local function same_mux(a, b)
+  return type(a) == "table" and type(b) == "table" and a.type == b.type and a.session == b.session
+end
+
+local function cleanup_nvim_server()
+  if M.nvim_server then
+    pcall(function() M.nvim_server:close() end)
+    M.nvim_server = nil
+  end
+  if M.nvim_socket_path then pcall(vim.uv.fs_unlink, M.nvim_socket_path) end
+  if M.nvim_info_path then pcall(vim.uv.fs_unlink, M.nvim_info_path) end
+end
+
+local function start_nvim_server()
+  local dir = "/tmp/pi-nvim-nvim-sockets"
+  vim.fn.mkdir(dir, "p")
+  M.nvim_socket_path = string.format("%s/nvim-%d.sock", dir, vim.fn.getpid())
+  M.nvim_info_path = M.nvim_socket_path .. ".info"
+  pcall(vim.uv.fs_unlink, M.nvim_socket_path)
+
+  local server = vim.uv.new_pipe(false)
+  if not server then return end
+  local ok = pcall(function()
+    server:bind(M.nvim_socket_path)
+    server:listen(16, function(err)
+      if err then return end
+      local client = vim.uv.new_pipe(false)
+      server:accept(client)
+      local buffer = ""
+      client:read_start(function(read_err, data)
+        if read_err or not data then client:close(); return end
+        buffer = buffer .. data
+        local newline = buffer:find("\n", 1, true)
+        if not newline then return end
+        local decoded, message = pcall(vim.json.decode, buffer:sub(1, newline - 1))
+        client:read_stop()
+        client:close()
+        if decoded and message.type == "open" and type(message.path) == "string" then
+          vim.schedule(function()
+            vim.cmd.edit(vim.fn.fnameescape(message.path))
+            local line = math.max(1, tonumber(message.line) or 1)
+            local column = math.max(1, tonumber(message.column) or 1)
+            pcall(vim.api.nvim_win_set_cursor, 0, { line, column - 1 })
+          end)
+        end
+      end)
+    end)
+  end)
+  if not ok then server:close(); return end
+  M.nvim_server = server
+  vim.fn.writefile({ vim.json.encode({
+    cwd = vim.uv.cwd(),
+    pid = vim.fn.getpid(),
+    socket = M.nvim_socket_path,
+    mux = get_mux_info(),
+  }) }, M.nvim_info_path)
+  vim.api.nvim_create_autocmd("VimLeavePre", { callback = cleanup_nvim_server, once = true })
+end
+
 --- @param opts pi_nvim.Config|nil
 function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", M.config, opts or {})
+  start_nvim_server()
 
   -- Auto-reload buffers when files are changed externally (e.g. by pi agent).
   -- Only polls when a pi session is reachable. Respects existing autoread setting.
@@ -75,39 +154,29 @@ function M.get_socket_path()
 
   local sockets_dir = "/tmp/pi-nvim-sockets"
   local cwd = vim.uv.cwd()
+  local mux = get_mux_info()
 
-  -- Scan the sockets directory for .info files
+  -- Prefer sessions sharing both multiplexer and cwd, then either one.
   local ok, files = pcall(vim.fn.glob, sockets_dir .. "/*.info", false, true)
   if ok and files then
-    -- First pass: exact cwd match, prefer newest socket
     local best_sock = nil
+    local best_score = -1
     local best_mtime = 0
     for _, info_path in ipairs(files) do
       local content_ok, content = pcall(vim.fn.readfile, info_path)
       if content_ok and content and content[1] then
         local parsed_ok, info = pcall(vim.json.decode, content[1])
         if parsed_ok and info then
-          local sock = info_path:sub(1, -6) -- strip ".info"
+          local sock = info_path:sub(1, -6)
           local stat = vim.uv.fs_stat(sock)
-          if info.cwd == cwd and stat then
-            if stat.mtime.sec > best_mtime then
+          if stat then
+            local score = (info.cwd == cwd and 2 or 0) + (same_mux(info.mux, mux) and 4 or 0)
+            if score > best_score or (score == best_score and stat.mtime.sec > best_mtime) then
+              best_score = score
               best_mtime = stat.mtime.sec
               best_sock = sock
             end
           end
-        end
-      end
-    end
-    if best_sock then return best_sock end
-
-    -- Second pass: any live session (newest)
-    for _, info_path in ipairs(files) do
-      local sock = info_path:sub(1, -6)
-      local stat = vim.uv.fs_stat(sock)
-      if stat then
-        if stat.mtime.sec > best_mtime then
-          best_mtime = stat.mtime.sec
-          best_sock = sock
         end
       end
     end

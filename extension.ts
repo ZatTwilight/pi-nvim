@@ -3,32 +3,16 @@ import * as net from "node:net";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
+import { execFileSync } from "node:child_process";
 
-/**
- * pi-nvim: Exposes a unix socket so external tools (like a neovim plugin)
- * can send prompts/context into a running interactive pi session.
- *
- * Repo: https://github.com/carderne/pi-nvim
- *
- * Protocol: newline-delimited JSON over a unix socket.
- *
- * Commands:
- *   { "type": "prompt", "message": "..." }
- *   { "type": "prompt", "message": "...", "images": [...] }
- *   { "type": "ping" }
- *
- * Responses:
- *   { "ok": true }
- *   { "ok": true, "type": "pong" }
- *   { "ok": false, "error": "..." }
- *
- * Socket path: /tmp/pi-nvim-<hash-of-cwd>.sock
- * A symlink at /tmp/pi-nvim-latest.sock always points to the most recently
- * started session, so neovim can just connect there if there's only one.
- *
- * The socket path for a given cwd is also written to /tmp/pi-nvim-sockets/<hash>
- * as a plain text file containing the cwd, so neovim can list all running sessions.
- */
+const SOCKETS_DIR = "/tmp/pi-nvim-sockets";
+const NVIM_SOCKETS_DIR = "/tmp/pi-nvim-nvim-sockets";
+const LATEST_LINK = "/tmp/pi-nvim-latest.sock";
+const EDITED_FILES_ENTRY = "pi-nvim-edited-file";
+
+type MuxInfo = { type: "tmux" | "zellij"; session: string } | null;
+type NvimInfo = { cwd?: string; pid?: number; socket?: string; mux?: MuxInfo };
+type OpenTarget = { path: string; line?: number; column?: number };
 
 function cwdHash(cwd: string): string {
   return crypto.createHash("md5").update(cwd).digest("hex").slice(0, 12);
@@ -38,23 +22,58 @@ function getSocketPath(cwd: string): string {
   return path.join(SOCKETS_DIR, `${cwdHash(cwd)}-${process.pid}.sock`);
 }
 
-const SOCKETS_DIR = "/tmp/pi-nvim-sockets";
-const LATEST_LINK = "/tmp/pi-nvim-latest.sock";
+function getMuxInfo(): MuxInfo {
+  if (process.env.ZELLIJ_SESSION_NAME) {
+    return { type: "zellij", session: process.env.ZELLIJ_SESSION_NAME };
+  }
+  if (process.env.TMUX) {
+    let session = process.env.PI_NVIM_TMUX_SESSION;
+    if (!session) {
+      try {
+        session = execFileSync("tmux", ["display-message", "-p", "#S"], {
+          encoding: "utf8",
+        }).trim();
+      } catch {
+        session = process.env.TMUX.split(",")[0];
+      }
+    }
+    return { type: "tmux", session };
+  }
+  return null;
+}
+
+function sameMux(a: MuxInfo | undefined, b: MuxInfo): boolean {
+  return !!a && !!b && a.type === b.type && a.session === b.session;
+}
+
+function parseOpenTarget(value: string, cwd: string): OpenTarget | null {
+  const match = value.trim().match(/^(.*?)(?::(\d+))?(?::(\d+))?$/);
+  if (!match || !match[1]) return null;
+  return {
+    path: path.resolve(cwd, match[1]),
+    line: match[2] ? Number(match[2]) : undefined,
+    column: match[3] ? Number(match[3]) : undefined,
+  };
+}
 
 export default function (pi: ExtensionAPI) {
   let server: net.Server | null = null;
   let socketPath: string | null = null;
+  let cwd = process.cwd();
+  let editedFiles: string[] = [];
 
   pi.on("session_start", async (_event, ctx) => {
-    const cwd = ctx.cwd;
-    // Ensure sockets directory exists
-    try {
-      fs.mkdirSync(SOCKETS_DIR, { recursive: true });
-    } catch {}
+    cwd = ctx.cwd;
+    editedFiles = [];
+    for (const entry of ctx.sessionManager.getBranch()) {
+      if (entry.type === "custom" && entry.customType === EDITED_FILES_ENTRY) {
+        const editedPath = (entry.data as { path?: unknown } | undefined)?.path;
+        if (typeof editedPath === "string") recordEditedFile(editedPath);
+      }
+    }
 
+    fs.mkdirSync(SOCKETS_DIR, { recursive: true });
     socketPath = getSocketPath(cwd);
-
-    // Clean up stale socket
     try {
       fs.unlinkSync(socketPath);
     } catch {}
@@ -67,71 +86,138 @@ export default function (pi: ExtensionAPI) {
         while ((newlineIdx = buffer.indexOf("\n")) !== -1) {
           const line = buffer.slice(0, newlineIdx).trim();
           buffer = buffer.slice(newlineIdx + 1);
-          if (!line) continue;
-          handleMessage(line, conn, cwd);
+          if (line) handleMessage(line, conn);
         }
       });
       conn.on("error", () => {});
     });
 
     server.listen(socketPath, () => {
-      // Update latest symlink
       try {
         fs.unlinkSync(LATEST_LINK);
       } catch {}
       try {
         fs.symlinkSync(socketPath!, LATEST_LINK);
       } catch {}
-
-      // Register in sockets directory for discovery
-      try {
-        fs.mkdirSync(SOCKETS_DIR, { recursive: true });
-        // Write a manifest file alongside the socket for discovery
-        fs.writeFileSync(
-          socketPath + ".info",
-          JSON.stringify({
-            cwd,
-            pid: process.pid,
-            startedAt: new Date().toISOString(),
-          }),
-        );
-      } catch {}
+      fs.writeFileSync(
+        socketPath + ".info",
+        JSON.stringify({
+          cwd,
+          pid: process.pid,
+          startedAt: new Date().toISOString(),
+          mux: getMuxInfo(),
+        }),
+      );
     });
 
-    server.on("error", (err) => {
-      ctx.ui.notify(`pi-nvim error: ${err.message}`, "error");
-    });
+    server.on("error", (err) => ctx.ui.notify(`pi-nvim error: ${err.message}`, "error"));
   });
 
-  function handleMessage(raw: string, conn: net.Socket, _cwd: string) {
+  function recordEditedFile(editedPath: string) {
+    const absolutePath = path.resolve(cwd, editedPath);
+    editedFiles = editedFiles.filter((candidate) => candidate !== absolutePath);
+    editedFiles.push(absolutePath);
+  }
+
+  pi.on("tool_result", (event) => {
+    if (event.isError || (event.toolName !== "edit" && event.toolName !== "write")) return;
+    const input = event.input as { path?: unknown };
+    if (typeof input.path !== "string") return;
+    const absolutePath = path.resolve(cwd, input.path.replace(/^@/, ""));
+    recordEditedFile(absolutePath);
+    pi.appendEntry(EDITED_FILES_ENTRY, { path: absolutePath });
+  });
+
+  function handleMessage(raw: string, conn: net.Socket) {
     try {
       const msg = JSON.parse(raw);
-
-      if (msg.type === "ping") {
-        respond(conn, { ok: true, type: "pong" });
-        return;
-      }
-
+      if (msg.type === "ping") return respond(conn, { ok: true, type: "pong" });
       if (msg.type === "prompt" && typeof msg.message === "string") {
-        // Exit kitty's scrollback viewer by switching to private screen mode
-        // and back. This snaps to the bottom without clearing scrollback history.
         process.stdout.write("\x1b[?1049h\x1b[?1049l");
         pi.sendUserMessage(msg.message, { deliverAs: "followUp" });
-        respond(conn, { ok: true });
-        return;
+        return respond(conn, { ok: true });
       }
-
       respond(conn, { ok: false, error: `Unknown command type: ${msg.type}` });
-    } catch (e: any) {
-      respond(conn, { ok: false, error: `Parse error: ${e.message}` });
+    } catch (error) {
+      respond(conn, { ok: false, error: `Parse error: ${(error as Error).message}` });
     }
   }
 
-  function respond(conn: net.Socket, obj: any) {
+  function respond(conn: net.Socket, value: unknown) {
     try {
-      conn.write(JSON.stringify(obj) + "\n");
+      conn.write(JSON.stringify(value) + "\n");
     } catch {}
   }
+
+  function findNvimSocket(): string | null {
+    let candidates: Array<{ socket: string; score: number; mtime: number }> = [];
+    const mux = getMuxInfo();
+    try {
+      for (const name of fs.readdirSync(NVIM_SOCKETS_DIR)) {
+        if (!name.endsWith(".info")) continue;
+        const info = JSON.parse(
+          fs.readFileSync(path.join(NVIM_SOCKETS_DIR, name), "utf8"),
+        ) as NvimInfo;
+        if (!info.socket || !fs.existsSync(info.socket)) continue;
+        const score = (info.cwd === cwd ? 2 : 0) + (sameMux(info.mux, mux) ? 4 : 0);
+        const mtime = fs.statSync(info.socket).mtimeMs;
+        candidates.push({ socket: info.socket, score, mtime });
+      }
+    } catch {}
+    candidates = candidates.sort((a, b) => b.score - a.score || b.mtime - a.mtime);
+    return candidates[0]?.socket ?? null;
+  }
+
+  async function openInNvim(
+    target: OpenTarget,
+    ctx: { ui: { notify(message: string, level: "info" | "warning" | "error"): void } },
+  ) {
+    const nvimSocket = findNvimSocket();
+    if (!nvimSocket) {
+      ctx.ui.notify("No Neovim instance found for this cwd/multiplexer session", "warning");
+      return;
+    }
+    const conn = net.createConnection(nvimSocket);
+    conn.on("connect", () => conn.end(JSON.stringify({ type: "open", ...target }) + "\n"));
+    conn.on("error", (error) =>
+      ctx.ui.notify(`Could not open in Neovim: ${error.message}`, "error"),
+    );
+  }
+
+  pi.registerCommand("open", {
+    description: "Open a file in the linked Neovim; without arguments, select a file edited by pi",
+    handler: async (args, ctx) => {
+      let target: OpenTarget | null = args.trim() ? parseOpenTarget(args, cwd) : null;
+      if (!target) {
+        if (editedFiles.length === 0) {
+          ctx.ui.notify(
+            "Pi has not edited any files with the edit/write tools in this session",
+            "warning",
+          );
+          return;
+        }
+        const choices = [...editedFiles].reverse();
+        const selected = await ctx.ui.select(
+          "Open Pi-edited file:",
+          choices.map((file) => path.relative(cwd, file)),
+        );
+        if (!selected) return;
+        target = {
+          path: choices[choices.map((file) => path.relative(cwd, file)).indexOf(selected)],
+        };
+      }
+      await openInNvim(target, ctx);
+    },
+  });
+
+  pi.registerCommand("pi-nvim-info", {
+    description: "Show pi-nvim socket path",
+    handler: async (_args, ctx) =>
+      ctx.ui.notify(
+        socketPath ? `Socket: ${socketPath}` : "pi-nvim not active",
+        socketPath ? "info" : "warning",
+      ),
+  });
 
   function cleanup() {
     if (server) {
@@ -139,33 +225,16 @@ export default function (pi: ExtensionAPI) {
       server = null;
     }
     try {
-      fs.unlinkSync(socketPath!);
+      if (socketPath) fs.unlinkSync(socketPath);
     } catch {}
     try {
-      // Clean up latest symlink if it points to us
-      const target = fs.readlinkSync(LATEST_LINK);
-      if (target === socketPath) fs.unlinkSync(LATEST_LINK);
+      if (socketPath) fs.unlinkSync(socketPath + ".info");
     } catch {}
     try {
-      fs.unlinkSync(socketPath + ".info");
+      if (fs.readlinkSync(LATEST_LINK) === socketPath) fs.unlinkSync(LATEST_LINK);
     } catch {}
   }
 
-  pi.on("session_shutdown", async () => {
-    cleanup();
-  });
-
-  // Also clean up on process exit
+  pi.on("session_shutdown", async () => cleanup());
   process.on("exit", cleanup);
-
-  pi.registerCommand("pi-nvim-info", {
-    description: "Show pi-nvim socket path",
-    handler: async (_args, ctx) => {
-      if (socketPath) {
-        ctx.ui.notify(`Socket: ${socketPath}`, "info");
-      } else {
-        ctx.ui.notify("pi-nvim not active", "warning");
-      }
-    },
-  });
 }
