@@ -1,7 +1,5 @@
 # pi-nvim
 
-<!-- Temporary comment -->
-
 Bridge between [pi](https://github.com/badlogic/pi) coding agent and Neovim. Run pi in one terminal pane and Neovim in another — send files, selections, and prompts from Neovim directly into your running pi session.
 
 ![demo](./demo/demo.gif)
@@ -55,6 +53,7 @@ Options (defaults):
 require("pi-nvim").setup({
   socket_path = nil, -- auto-discover
   set_default_keymaps = true,
+  focus_on_open = true, -- focus this tmux/Zellij pane after /open
 })
 ```
 
@@ -122,7 +121,9 @@ Those options add either overhead or false positives and are not enabled current
 
 ## Multiplexer matching
 
-Both pi and Neovim publish their working directory and multiplexer identity. Zellij uses `ZELLIJ_SESSION_NAME`. tmux uses `PI_NVIM_TMUX_SESSION` when set, otherwise it queries `tmux display-message -p '#S'` for the session name. Candidates in the same multiplexer session are preferred, with cwd used as an additional match signal.
+Both pi and Neovim publish their working directory, multiplexer identity, and Neovim pane ID. Zellij uses `ZELLIJ_SESSION_NAME` and `ZELLIJ_PANE_ID`. tmux uses `TMUX_PANE` plus `PI_NVIM_TMUX_SESSION` when set, otherwise it queries `tmux display-message -p '#S'` for the session name. Candidates in the same multiplexer session are preferred, with cwd used as an additional match signal.
+
+After `/open` sends the file location, pi focuses the corresponding pane with `tmux select-pane` or `zellij action focus-pane-id`. Set `focus_on_open = false` in Neovim's `setup()` options to keep focus in the pi pane. Failure to focus only produces a warning; the file still opens.
 
 ## Protocol
 

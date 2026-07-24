@@ -3,15 +3,21 @@ import * as net from "node:net";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 
 const SOCKETS_DIR = "/tmp/pi-nvim-sockets";
 const NVIM_SOCKETS_DIR = "/tmp/pi-nvim-nvim-sockets";
 const LATEST_LINK = "/tmp/pi-nvim-latest.sock";
 const EDITED_FILES_ENTRY = "pi-nvim-edited-file";
 
-type MuxInfo = { type: "tmux" | "zellij"; session: string } | null;
-type NvimInfo = { cwd?: string; pid?: number; socket?: string; mux?: MuxInfo };
+type MuxInfo = { type: "tmux" | "zellij"; session: string; pane?: string } | null;
+type NvimInfo = {
+  cwd?: string;
+  pid?: number;
+  socket?: string;
+  mux?: MuxInfo;
+  focusOnOpen?: boolean;
+};
 type OpenTarget = { path: string; line?: number; column?: number };
 
 function cwdHash(cwd: string): string {
@@ -149,8 +155,8 @@ export default function (pi: ExtensionAPI) {
     } catch {}
   }
 
-  function findNvimSocket(): string | null {
-    let candidates: Array<{ socket: string; score: number; mtime: number }> = [];
+  function findNvim(): NvimInfo | null {
+    let candidates: Array<{ info: NvimInfo; score: number; mtime: number }> = [];
     const mux = getMuxInfo();
     try {
       for (const name of fs.readdirSync(NVIM_SOCKETS_DIR)) {
@@ -161,24 +167,42 @@ export default function (pi: ExtensionAPI) {
         if (!info.socket || !fs.existsSync(info.socket)) continue;
         const score = (info.cwd === cwd ? 2 : 0) + (sameMux(info.mux, mux) ? 4 : 0);
         const mtime = fs.statSync(info.socket).mtimeMs;
-        candidates.push({ socket: info.socket, score, mtime });
+        candidates.push({ info, score, mtime });
       }
     } catch {}
     candidates = candidates.sort((a, b) => b.score - a.score || b.mtime - a.mtime);
-    return candidates[0]?.socket ?? null;
+    return candidates[0]?.info ?? null;
+  }
+
+  async function focusNvimPane(info: NvimInfo): Promise<void> {
+    if (info.focusOnOpen === false || !info.mux?.pane) return;
+    const args =
+      info.mux.type === "tmux"
+        ? ["select-pane", "-t", info.mux.pane]
+        : ["--session", info.mux.session, "action", "focus-pane-id", info.mux.pane];
+    const command = info.mux.type === "tmux" ? "tmux" : "zellij";
+    await new Promise<void>((resolve, reject) => {
+      execFile(command, args, (error) => (error ? reject(error) : resolve()));
+    });
   }
 
   async function openInNvim(
     target: OpenTarget,
     ctx: { ui: { notify(message: string, level: "info" | "warning" | "error"): void } },
   ) {
-    const nvimSocket = findNvimSocket();
-    if (!nvimSocket) {
+    const nvim = findNvim();
+    if (!nvim?.socket) {
       ctx.ui.notify("No Neovim instance found for this cwd/multiplexer session", "warning");
       return;
     }
-    const conn = net.createConnection(nvimSocket);
-    conn.on("connect", () => conn.end(JSON.stringify({ type: "open", ...target }) + "\n"));
+    const conn = net.createConnection(nvim.socket);
+    conn.on("connect", () => {
+      conn.end(JSON.stringify({ type: "open", ...target }) + "\n", () => {
+        focusNvimPane(nvim).catch((error: Error) =>
+          ctx.ui.notify(`Opened file, but could not focus Neovim: ${error.message}`, "warning"),
+        );
+      });
+    });
     conn.on("error", (error) =>
       ctx.ui.notify(`Could not open in Neovim: ${error.message}`, "error"),
     );

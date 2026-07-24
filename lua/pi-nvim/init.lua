@@ -3,9 +3,11 @@ local M = {}
 --- @class pi_nvim.Config
 --- @field socket_path string|nil  Override socket path (default: auto-discover)
 --- @field set_default_keymaps boolean|nil  Whether to create the default <leader>p mappings (default: true)
+--- @field focus_on_open boolean|nil  Focus this multiplexer pane after pi opens a file (default: true)
 M.config = {
   socket_path = nil,
   set_default_keymaps = true,
+  focus_on_open = true,
 }
 
 M.nvim_server = nil
@@ -14,7 +16,7 @@ M.nvim_info_path = nil
 
 local function get_mux_info()
   if vim.env.ZELLIJ_SESSION_NAME and vim.env.ZELLIJ_SESSION_NAME ~= "" then
-    return { type = "zellij", session = vim.env.ZELLIJ_SESSION_NAME }
+    return { type = "zellij", session = vim.env.ZELLIJ_SESSION_NAME, pane = vim.env.ZELLIJ_PANE_ID }
   end
   if vim.env.TMUX and vim.env.TMUX ~= "" then
     local session = vim.env.PI_NVIM_TMUX_SESSION
@@ -22,7 +24,7 @@ local function get_mux_info()
       local result = vim.fn.system({ "tmux", "display-message", "-p", "#S" })
       if vim.v.shell_error == 0 then session = vim.trim(result) end
     end
-    return { type = "tmux", session = session or vim.env.TMUX:match("^[^,]+") }
+    return { type = "tmux", session = session or vim.env.TMUX:match("^[^,]+"), pane = vim.env.TMUX_PANE }
   end
   return vim.NIL
 end
@@ -82,6 +84,7 @@ local function start_nvim_server()
     pid = vim.fn.getpid(),
     socket = M.nvim_socket_path,
     mux = get_mux_info(),
+    focusOnOpen = M.config.focus_on_open,
   }) }, M.nvim_info_path)
   vim.api.nvim_create_autocmd("VimLeavePre", { callback = cleanup_nvim_server, once = true })
 end
