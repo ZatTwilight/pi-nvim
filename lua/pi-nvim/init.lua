@@ -4,10 +4,12 @@ local M = {}
 --- @field socket_path string|nil  Override socket path (default: auto-discover)
 --- @field set_default_keymaps boolean|nil  Whether to create the default <leader>p mappings (default: true)
 --- @field focus_on_open boolean|nil  Focus this multiplexer pane after pi opens a file (default: true)
+--- @field focus_on_send boolean|nil  Focus pi's multiplexer pane after sending a prompt (default: true)
 M.config = {
   socket_path = nil,
   set_default_keymaps = true,
   focus_on_open = true,
+  focus_on_send = true,
 }
 
 M.nvim_server = nil
@@ -195,6 +197,41 @@ function M.get_socket_path()
   return nil
 end
 
+local function focus_pi_pane()
+  if not M.config.focus_on_send then return end
+  local selected_socket = M.get_socket_path()
+  if not selected_socket then return end
+  local selected_realpath = vim.uv.fs_realpath(selected_socket) or selected_socket
+  local files = vim.fn.glob("/tmp/pi-nvim-sockets/*.info", false, true)
+  for _, info_path in ipairs(files) do
+    local socket = info_path:sub(1, -6)
+    local socket_realpath = vim.uv.fs_realpath(socket) or socket
+    if socket_realpath == selected_realpath then
+      local ok, lines = pcall(vim.fn.readfile, info_path)
+      local decoded, info = false, nil
+      if ok and lines and lines[1] then decoded, info = pcall(vim.json.decode, lines[1]) end
+      if decoded and type(info.mux) == "table" and info.mux.pane then
+        local command
+        if info.mux.type == "tmux" then
+          command = { "tmux", "select-pane", "-t", info.mux.pane }
+        elseif info.mux.type == "zellij" then
+          command = { "zellij", "--session", info.mux.session, "action", "focus-pane-id", info.mux.pane }
+        end
+        if command then
+          vim.system(command, {}, function(result)
+            if result.code ~= 0 then
+              vim.schedule(function()
+                vim.notify("Sent to pi, but could not focus its pane", vim.log.levels.WARN)
+              end)
+            end
+          end)
+        end
+      end
+      return
+    end
+  end
+end
+
 --- Send a raw JSON message to the pi socket and call cb with the parsed response.
 --- @param msg table
 --- @param cb fun(err: string|nil, response: table|nil)|nil
@@ -293,7 +330,7 @@ function M.prompt(message)
         local payload = "\x1b[200~" .. message .. "\x1b[201~\r"
         vim.api.nvim_chan_send(id, payload)
         vim.cmd("startinsert")
-        
+
         vim.notify("Sent to pi terminal buffer", vim.log.levels.INFO)
         return
       end
@@ -303,6 +340,7 @@ function M.prompt(message)
       if err then return end
       if resp and resp.ok then
         vim.notify("Sent to pi", vim.log.levels.INFO)
+        focus_pi_pane()
       else
         vim.notify("pi error: " .. (resp and resp.error or "unknown"), vim.log.levels.ERROR)
       end

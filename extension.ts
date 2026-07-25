@@ -30,7 +30,11 @@ function getSocketPath(cwd: string): string {
 
 function getMuxInfo(): MuxInfo {
   if (process.env.ZELLIJ_SESSION_NAME) {
-    return { type: "zellij", session: process.env.ZELLIJ_SESSION_NAME };
+    return {
+      type: "zellij",
+      session: process.env.ZELLIJ_SESSION_NAME,
+      pane: process.env.ZELLIJ_PANE_ID,
+    };
   }
   if (process.env.TMUX) {
     let session = process.env.PI_NVIM_TMUX_SESSION;
@@ -43,7 +47,7 @@ function getMuxInfo(): MuxInfo {
         session = process.env.TMUX.split(",")[0];
       }
     }
-    return { type: "tmux", session };
+    return { type: "tmux", session, pane: process.env.TMUX_PANE };
   }
   return null;
 }
