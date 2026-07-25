@@ -78,9 +78,10 @@ Start pi in one terminal. Start Neovim in another. The pi extension automaticall
 
 ### Default keybindings
 
-`<leader>p` is mapped to `:Pi` in both normal and visual mode by default.
+- In Neovim, `<leader>p` is mapped to `:Pi` in both normal and visual mode.
+- In pi, `Alt+O` opens the Pi-edited file picker and sends the selected location to Neovim.
 
-To disable the default mappings:
+To disable the default Neovim mappings:
 
 ```lua
 require("pi-nvim").setup({
@@ -110,7 +111,9 @@ vim.keymap.set("n", "<leader>pi", ":PiPing<CR>")
 
 ## Edited-file tracking
 
-Pi tracks successful uses of its `edit` and `write` tools for the current session. The list is persisted in pi's session entries, so it survives extension reloads and session resume. Running `/open` without arguments shows those files in a TUI selector, most recently edited first.
+Pi tracks every successful use of its `edit` and `write` tools, including its timestamp, exact changed line ranges, and Git-style added/removed line counts. For `edit`, this comes from pi's resulting unified diff. For `write`, the extension snapshots the previous content and computes a before/after diff.
+
+The history is persisted in pi's session entries, so it survives extension reloads and session resume. Running `/open` without arguments first shows files ordered by their latest mutation, with aggregate `+added -removed` totals, edit count, and relative time. Selecting a file shows its individual edit/write operations; selecting an operation opens Neovim at its first changed line.
 
 This practical default intentionally does **not** claim to detect files changed by arbitrary `bash` commands, formatters, generators, or other custom tools. More complete alternatives would be:
 
@@ -122,9 +125,9 @@ Those options add either overhead or false positives and are not enabled current
 
 ## Multiplexer matching
 
-Both pi and Neovim publish their working directory, multiplexer identity, and Neovim pane ID. Zellij uses `ZELLIJ_SESSION_NAME` and `ZELLIJ_PANE_ID`. tmux uses `TMUX_PANE` plus `PI_NVIM_TMUX_SESSION` when set, otherwise it queries `tmux display-message -p '#S'` for the session name. Candidates in the same multiplexer session are preferred, with cwd used as an additional match signal.
+Both pi and Neovim publish their working directory, multiplexer identity, and pane ID. Zellij uses `ZELLIJ_SESSION_NAME` and `ZELLIJ_PANE_ID`. tmux uses `TMUX_PANE` plus `PI_NVIM_TMUX_SESSION` when set, otherwise it queries `tmux display-message -p '#S'` for the session name. herdr uses `HERDR_PANE_ID` as its canonical identity and resolves the pane's current tab and workspace with `herdr pane get`; the environment's `HERDR_TAB_ID` and `HERDR_WORKSPACE_ID` are fallback hints. Candidates in the same multiplexer session or herdr workspace are preferred, with cwd used as an additional match signal.
 
-After `/open` sends the file location, pi focuses the corresponding Neovim pane. In the other direction, a successful `:Pi`/`:PiSend*` request focuses the receiving pi pane. Both directions use `tmux select-pane` or `zellij action focus-pane-id`.
+After `/open` sends the file location, pi focuses the corresponding Neovim pane. In the other direction, a successful `:Pi`/`:PiSend*` request focuses the receiving pi pane. tmux and Zellij focus panes directly. herdr focuses the resolved workspace and tab; herdr currently cannot target an arbitrary pane within a split tab by ID.
 
 Set `focus_on_open = false` to keep focus in pi after `/open`, or `focus_on_send = false` to stay in Neovim after sending. Focus failures only produce warnings; messages and file-open requests still succeed.
 

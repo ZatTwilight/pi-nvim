@@ -16,7 +16,33 @@ M.nvim_server = nil
 M.nvim_socket_path = nil
 M.nvim_info_path = nil
 
+local function get_herdr_pane(pane, socket)
+  local opts = socket and { env = { HERDR_SOCKET_PATH = socket } } or {}
+  local result = vim.system({ "herdr", "pane", "get", pane }, opts):wait()
+  if result.code ~= 0 then return nil end
+  local ok, response = pcall(vim.json.decode, result.stdout)
+  local resolved = ok and response and response.result and response.result.pane or nil
+  if type(resolved) == "table" and type(resolved.pane_id) == "string"
+      and type(resolved.tab_id) == "string" and type(resolved.workspace_id) == "string" then
+    return resolved
+  end
+  return nil
+end
+
 local function get_mux_info()
+  if vim.env.HERDR_PANE_ID and vim.env.HERDR_PANE_ID ~= "" then
+    local resolved = get_herdr_pane(vim.env.HERDR_PANE_ID)
+    local workspace = resolved and resolved.workspace_id or vim.env.HERDR_WORKSPACE_ID
+    if workspace and workspace ~= "" then
+      return {
+        type = "herdr",
+        session = workspace,
+        pane = resolved and resolved.pane_id or vim.env.HERDR_PANE_ID,
+        tab = resolved and resolved.tab_id or vim.env.HERDR_TAB_ID,
+        socket = vim.env.HERDR_SOCKET_PATH,
+      }
+    end
+  end
   if vim.env.ZELLIJ_SESSION_NAME and vim.env.ZELLIJ_SESSION_NAME ~= "" then
     return { type = "zellij", session = vim.env.ZELLIJ_SESSION_NAME, pane = vim.env.ZELLIJ_PANE_ID }
   end
@@ -216,6 +242,28 @@ local function focus_pi_pane()
           command = { "tmux", "select-pane", "-t", info.mux.pane }
         elseif info.mux.type == "zellij" then
           command = { "zellij", "--session", info.mux.session, "action", "focus-pane-id", info.mux.pane }
+        elseif info.mux.type == "herdr" then
+          local resolved = get_herdr_pane(info.mux.pane, info.mux.socket)
+          local workspace = resolved and resolved.workspace_id or info.mux.session
+          local tab = resolved and resolved.tab_id or info.mux.tab
+          if workspace and tab then
+            local opts = info.mux.socket and { env = { HERDR_SOCKET_PATH = info.mux.socket } } or {}
+            vim.system({ "herdr", "workspace", "focus", workspace }, opts, function(workspace_result)
+              if workspace_result.code ~= 0 then
+                vim.schedule(function()
+                  vim.notify("Sent to pi, but could not focus its herdr workspace", vim.log.levels.WARN)
+                end)
+                return
+              end
+              vim.system({ "herdr", "tab", "focus", tab }, opts, function(tab_result)
+                if tab_result.code ~= 0 then
+                  vim.schedule(function()
+                    vim.notify("Sent to pi, but could not focus its herdr tab", vim.log.levels.WARN)
+                  end)
+                end
+              end)
+            end)
+          end
         end
         if command then
           vim.system(command, {}, function(result)
