@@ -113,7 +113,7 @@ vim.keymap.set("n", "<leader>pi", ":PiPing<CR>")
 
 Pi tracks every successful use of its `edit` and `write` tools, including its timestamp, exact changed line ranges, and Git-style added/removed line counts. For `edit`, this comes from pi's resulting unified diff. For `write`, the extension snapshots the previous content and computes a before/after diff.
 
-The history is persisted in pi's session entries, so it survives extension reloads and session resume. Running `/open` without arguments first shows files ordered by their latest mutation, with aggregate `+added -removed` totals, edit count, and relative time. Selecting a file shows its individual edit/write operations; selecting an operation opens Neovim at its first changed line.
+The history is persisted in pi's session entries, so it survives extension reloads and session resume. Mutations are grouped by the user prompt that caused them. Running `/open` without arguments shows only files changed for the latest prompt by default, ordered by their latest mutation, with aggregate `+added -removed` totals, edit count, and relative time. An “earlier turns” entry keeps older blocks available without cluttering the default picker. Selecting a file shows its individual edit/write operations; selecting an operation opens Neovim at its first changed line.
 
 This practical default intentionally does **not** claim to detect files changed by arbitrary `bash` commands, formatters, generators, or other custom tools. More complete alternatives would be:
 

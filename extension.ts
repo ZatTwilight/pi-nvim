@@ -39,6 +39,7 @@ type EditRange = {
 type FileMutation = {
   path: string;
   toolName: "edit" | "write";
+  turnId: string;
   timestamp: number;
   added: number;
   removed: number;
@@ -216,13 +217,19 @@ export default function (pi: ExtensionAPI) {
   let socketPath: string | null = null;
   let cwd = process.cwd();
   let mutations: FileMutation[] = [];
+  let currentTurnId = "session-start";
   const beforeWrites = new Map<string, string>();
 
   pi.on("session_start", async (_event, ctx) => {
     cwd = ctx.cwd;
     mutations = [];
+    currentTurnId = "session-start";
     beforeWrites.clear();
     for (const entry of ctx.sessionManager.getBranch()) {
+      if (entry.type === "message" && entry.message.role === "user") {
+        currentTurnId = entry.id;
+        continue;
+      }
       if (entry.type !== "custom" || entry.customType !== EDITED_FILES_ENTRY) continue;
       const data = entry.data as Partial<FileMutation> | undefined;
       if (!data || typeof data.path !== "string") continue;
@@ -232,6 +239,7 @@ export default function (pi: ExtensionAPI) {
         mutations.push({
           path: path.resolve(cwd, data.path),
           toolName: data.toolName,
+          turnId: typeof data.turnId === "string" ? data.turnId : currentTurnId,
           timestamp: typeof data.timestamp === "number" ? data.timestamp : Date.now(),
           added: recovered.added || (typeof data.added === "number" ? data.added : 0),
           removed: recovered.removed || (typeof data.removed === "number" ? data.removed : 0),
@@ -287,6 +295,10 @@ export default function (pi: ExtensionAPI) {
     server.on("error", (err) => ctx.ui.notify(`pi-nvim error: ${err.message}`, "error"));
   });
 
+  pi.on("before_agent_start", () => {
+    currentTurnId = crypto.randomUUID();
+  });
+
   pi.on("tool_call", async (event) => {
     if (event.toolName !== "write") return;
     const input = event.input as { path?: unknown };
@@ -337,6 +349,7 @@ export default function (pi: ExtensionAPI) {
     const mutation: FileMutation = {
       path: absolutePath,
       toolName: event.toolName,
+      turnId: currentTurnId,
       timestamp: Date.now(),
       ...stats,
       diff,
@@ -434,6 +447,69 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
+  async function selectMutation(
+    block: FileMutation[],
+    ctx: ExtensionContext,
+    showEarlierTurns: boolean,
+  ): Promise<OpenTarget | "earlier" | null> {
+    const byFile = new Map<string, FileMutation[]>();
+    for (const mutation of block) {
+      const history = byFile.get(mutation.path) ?? [];
+      history.push(mutation);
+      byFile.set(mutation.path, history);
+    }
+    const files = [...byFile.entries()].sort(
+      (a, b) => b[1][b[1].length - 1].timestamp - a[1][a[1].length - 1].timestamp,
+    );
+    const fileLabels = files.map(([file, history]) => {
+      const added = history.reduce((total, mutation) => total + mutation.added, 0);
+      const removed = history.reduce((total, mutation) => total + mutation.removed, 0);
+      const latest = history[history.length - 1];
+      const fileName = ctx.ui.theme.fg("accent", path.relative(cwd, file));
+      const additions = ctx.ui.theme.fg("success", `+${added}`);
+      const removals = ctx.ui.theme.fg("error", `-${removed}`);
+      const metadata = ctx.ui.theme.fg(
+        "dim",
+        `· ${history.length} edit${history.length === 1 ? "" : "s"} · ${formatRelativeTime(latest.timestamp)}`,
+      );
+      return `${fileName}  ${additions} ${removals} ${metadata}`;
+    });
+    const earlierTurnsLabel = ctx.ui.theme.fg("muted", "Show edits from earlier turns…");
+    const choices = showEarlierTurns ? [...fileLabels, earlierTurnsLabel] : fileLabels;
+    const selectedFile = await ctx.ui.select("Open Pi-edited file:", choices);
+    if (!selectedFile) return null;
+    if (selectedFile === earlierTurnsLabel) return "earlier";
+    const [selectedPath, history] = files[fileLabels.indexOf(selectedFile)];
+
+    const newestFirst = [...history].reverse();
+    if (newestFirst.length === 1) {
+      return { path: selectedPath, line: newestFirst[0].ranges[0]?.startLine };
+    }
+
+    const editLabels = newestFirst.map((mutation, index) => {
+      const range = mutation.ranges[0];
+      const location = range
+        ? range.startLine === range.endLine
+          ? `line ${range.startLine}`
+          : `lines ${range.startLine}-${range.endLine}`
+        : "location unavailable";
+      const moreRanges = mutation.ranges.length > 1 ? ` + ${mutation.ranges.length - 1} more` : "";
+      const number = ctx.ui.theme.fg("muted", `${index + 1}.`);
+      const tool = ctx.ui.theme.fg("accent", mutation.toolName);
+      const additions = ctx.ui.theme.fg("success", `+${mutation.added}`);
+      const removals = ctx.ui.theme.fg("error", `-${mutation.removed}`);
+      const time = ctx.ui.theme.fg("dim", formatRelativeTime(mutation.timestamp));
+      return `${number} ${tool} · ${location}${moreRanges} · ${additions} ${removals} · ${time}`;
+    });
+    const selectedEdit = await ctx.ui.select(
+      `Open edit in ${path.relative(cwd, selectedPath)}:`,
+      editLabels,
+    );
+    if (!selectedEdit) return null;
+    const mutation = newestFirst[editLabels.indexOf(selectedEdit)];
+    return { path: selectedPath, line: mutation.ranges[0]?.startLine };
+  }
+
   const openInLinkedNvim = async (args: string, ctx: ExtensionContext) => {
     let target: OpenTarget | null = args.trim() ? parseOpenTarget(args, cwd) : null;
     if (!target) {
@@ -445,62 +521,36 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const byFile = new Map<string, FileMutation[]>();
+      const blocks = new Map<string, FileMutation[]>();
       for (const mutation of mutations) {
-        const history = byFile.get(mutation.path) ?? [];
-        history.push(mutation);
-        byFile.set(mutation.path, history);
+        const block = blocks.get(mutation.turnId) ?? [];
+        block.push(mutation);
+        blocks.set(mutation.turnId, block);
       }
-      const files = [...byFile.entries()].sort(
-        (a, b) => b[1][b[1].length - 1].timestamp - a[1][a[1].length - 1].timestamp,
-      );
-      const fileLabels = files.map(([file, history]) => {
-        const added = history.reduce((total, mutation) => total + mutation.added, 0);
-        const removed = history.reduce((total, mutation) => total + mutation.removed, 0);
-        const latest = history[history.length - 1];
-        const fileName = ctx.ui.theme.fg("accent", path.relative(cwd, file));
-        const additions = ctx.ui.theme.fg("success", `+${added}`);
-        const removals = ctx.ui.theme.fg("error", `-${removed}`);
-        const metadata = ctx.ui.theme.fg(
-          "dim",
-          `· ${history.length} edit${history.length === 1 ? "" : "s"} · ${formatRelativeTime(latest.timestamp)}`,
-        );
-        return `${fileName}  ${additions} ${removals} ${metadata}`;
-      });
-      const selectedFile = await ctx.ui.select("Open Pi-edited file:", fileLabels);
-      if (!selectedFile) return;
-      const fileIndex = fileLabels.indexOf(selectedFile);
-      const [selectedPath, history] = files[fileIndex];
+      const newestFirst = [...blocks.values()].reverse();
+      const selection = await selectMutation(newestFirst[0], ctx, newestFirst.length > 1);
+      if (selection !== "earlier") target = selection;
 
-      const newestFirst = [...history].reverse();
-      const editLabels = newestFirst.map((mutation, index) => {
-        const range = mutation.ranges[0];
-        const location = range
-          ? range.startLine === range.endLine
-            ? `line ${range.startLine}`
-            : `lines ${range.startLine}-${range.endLine}`
-          : "location unavailable";
-        const moreRanges =
-          mutation.ranges.length > 1 ? ` + ${mutation.ranges.length - 1} more` : "";
-        const number = ctx.ui.theme.fg("muted", `${index + 1}.`);
-        const tool = ctx.ui.theme.fg("accent", mutation.toolName);
-        const additions = ctx.ui.theme.fg("success", `+${mutation.added}`);
-        const removals = ctx.ui.theme.fg("error", `-${mutation.removed}`);
-        const time = ctx.ui.theme.fg("dim", formatRelativeTime(mutation.timestamp));
-        return `${number} ${tool} · ${location}${moreRanges} · ${additions} ${removals} · ${time}`;
-      });
-      if (newestFirst.length === 1) {
-        const mutation = newestFirst[0];
-        target = { path: selectedPath, line: mutation.ranges[0]?.startLine };
-      } else {
-        const selectedEdit = await ctx.ui.select(
-          `Open edit in ${path.relative(cwd, selectedPath)}:`,
-          editLabels,
+      if (selection === "earlier") {
+        const earlierBlocks = newestFirst.slice(1);
+        const blockLabels = earlierBlocks.map((block, index) => {
+          const latest = block[block.length - 1];
+          const files = new Set(block.map((mutation) => mutation.path)).size;
+          return `${index + 1}. ${block.length} edit${block.length === 1 ? "" : "s"} in ${files} file${files === 1 ? "" : "s"} · ${formatRelativeTime(latest.timestamp)}`;
+        });
+        const selectedBlock = await ctx.ui.select(
+          "Show edits from which earlier turn?",
+          blockLabels,
         );
-        if (!selectedEdit) return;
-        const mutation = newestFirst[editLabels.indexOf(selectedEdit)];
-        target = { path: selectedPath, line: mutation.ranges[0]?.startLine };
+        if (!selectedBlock) return;
+        const earlierSelection = await selectMutation(
+          earlierBlocks[blockLabels.indexOf(selectedBlock)],
+          ctx,
+          false,
+        );
+        target = earlierSelection === "earlier" ? null : earlierSelection;
       }
+      if (!target) return;
     }
     await openInNvim(target, ctx);
   };
