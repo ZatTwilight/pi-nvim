@@ -127,7 +127,7 @@ Those options add either overhead or false positives and are not enabled current
 
 Both pi and Neovim publish their working directory, multiplexer identity, and pane ID. Zellij uses `ZELLIJ_SESSION_NAME` and `ZELLIJ_PANE_ID`. tmux uses `TMUX_PANE` plus `PI_NVIM_TMUX_SESSION` when set, otherwise it queries `tmux display-message -p '#S'` for the session name. herdr uses `HERDR_PANE_ID` as its canonical identity and resolves the pane's current tab and workspace with `herdr pane get`; the environment's `HERDR_TAB_ID` and `HERDR_WORKSPACE_ID` are fallback hints. Candidates in the same multiplexer session or herdr workspace are preferred, with cwd used as an additional match signal.
 
-After `/open` sends the file location, pi focuses the corresponding Neovim pane. In the other direction, a successful `:Pi`/`:PiSend*` request focuses the receiving pi pane. tmux and Zellij focus panes directly. herdr focuses the resolved workspace and tab; herdr currently cannot target an arbitrary pane within a split tab by ID.
+After `/open` sends the file location, pi focuses the corresponding Neovim pane. In the other direction, a successful `:Pi`/`:PiSend*` request focuses the receiving pi pane. tmux and Zellij focus panes directly. herdr focuses the resolved workspace and tab, then targets the exact pane through Herdr's socket API so split panes in the same tab work correctly.
 
 Set `focus_on_open = false` to keep focus in pi after `/open`, or `focus_on_send = false` to stay in Neovim after sending. Focus failures only produce warnings; messages and file-open requests still succeed.
 

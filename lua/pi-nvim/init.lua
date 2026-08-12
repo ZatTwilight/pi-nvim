@@ -29,6 +29,63 @@ local function get_herdr_pane(pane, socket)
   return nil
 end
 
+local function focus_herdr_pane(pane, socket, callback)
+  socket = socket or vim.env.HERDR_SOCKET_PATH
+  if not socket or socket == "" then
+    callback("Herdr socket path is unavailable")
+    return
+  end
+
+  local client = vim.uv.new_pipe(false)
+  if not client then
+    callback("Could not create Herdr socket client")
+    return
+  end
+
+  local buffer = ""
+  local settled = false
+  local function finish(err)
+    if settled then return end
+    settled = true
+    pcall(function() client:read_stop() end)
+    if not client:is_closing() then client:close() end
+    callback(err)
+  end
+
+  client:connect(socket, function(connect_err)
+    if connect_err then
+      finish(connect_err)
+      return
+    end
+    client:read_start(function(read_err, data)
+      if read_err then
+        finish(read_err)
+        return
+      end
+      if not data then
+        finish("Herdr closed the focus request without a response")
+        return
+      end
+      buffer = buffer .. data
+      local newline = buffer:find("\n", 1, true)
+      if not newline then return end
+      local decoded, response = pcall(vim.json.decode, buffer:sub(1, newline - 1))
+      if not decoded then
+        finish("Could not decode Herdr focus response")
+      elseif response.error then
+        finish(response.error.message or "Could not focus Herdr pane")
+      else
+        finish(nil)
+      end
+    end)
+    client:write(vim.json.encode({
+      id = "pi-nvim-" .. tostring(vim.uv.hrtime()),
+      method = "pane.focus",
+      params = { pane_id = pane },
+    }) .. "\n")
+  end)
+end
+
 local function get_mux_info()
   if vim.env.HERDR_PANE_ID and vim.env.HERDR_PANE_ID ~= "" then
     local resolved = get_herdr_pane(vim.env.HERDR_PANE_ID)
@@ -260,7 +317,15 @@ local function focus_pi_pane()
                   vim.schedule(function()
                     vim.notify("Sent to pi, but could not focus its herdr tab", vim.log.levels.WARN)
                   end)
+                  return
                 end
+                focus_herdr_pane(resolved and resolved.pane_id or info.mux.pane, info.mux.socket, function(focus_err)
+                  if focus_err then
+                    vim.schedule(function()
+                      vim.notify("Sent to pi, but could not focus its herdr pane: " .. focus_err, vim.log.levels.WARN)
+                    end)
+                  end
+                end)
               end)
             end)
           end

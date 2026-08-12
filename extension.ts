@@ -173,6 +173,60 @@ function getHerdrPane(pane: string, socket?: string): HerdrPane | null {
   return null;
 }
 
+function focusHerdrPane(pane: string, socket?: string): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (!socket) {
+      reject(new Error("Herdr socket path is unavailable"));
+      return;
+    }
+    const conn = net.createConnection(socket);
+    let buffer = "";
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      conn.destroy();
+      if (error) reject(error);
+      else resolve();
+    };
+    conn.setEncoding("utf8");
+    conn.on("connect", () => {
+      conn.write(
+        JSON.stringify({
+          id: `pi-nvim-${crypto.randomUUID()}`,
+          method: "pane.focus",
+          params: { pane_id: pane },
+        }) + "\n",
+      );
+    });
+    conn.on("data", (data) => {
+      buffer += data;
+      const newline = buffer.indexOf("\n");
+      if (newline === -1) return;
+      try {
+        const response = JSON.parse(buffer.slice(0, newline)) as {
+          error?: { message?: unknown };
+        };
+        if (response.error) {
+          finish(
+            new Error(
+              typeof response.error.message === "string"
+                ? response.error.message
+                : `Could not focus Herdr pane ${pane}`,
+            ),
+          );
+        } else {
+          finish();
+        }
+      } catch (error) {
+        finish(error as Error);
+      }
+    });
+    conn.on("error", (error) => finish(error));
+    conn.on("end", () => finish(new Error("Herdr closed the focus request without a response")));
+  });
+}
+
 function getMuxInfo(): MuxInfo {
   if (process.env.HERDR_PANE_ID) {
     const socket = process.env.HERDR_SOCKET_PATH;
@@ -423,6 +477,7 @@ export default function (pi: ExtensionAPI) {
         : process.env;
       await exec("herdr", ["workspace", "focus", workspace], env);
       await exec("herdr", ["tab", "focus", tab], env);
+      await focusHerdrPane(resolved?.pane_id ?? info.mux.pane, info.mux.socket);
       return;
     }
     const args =
