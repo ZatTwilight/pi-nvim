@@ -1,4 +1,17 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  DynamicBorder,
+  type ExtensionAPI,
+  type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
+import {
+  Container,
+  Key,
+  type SelectItem,
+  SelectList,
+  Spacer,
+  Text,
+  matchesKey,
+} from "@earendil-works/pi-tui";
 import * as net from "node:net";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -447,11 +460,83 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
+  async function selectPopup(
+    title: string,
+    options: string[],
+    ctx: ExtensionContext,
+    canGoBack: boolean,
+  ): Promise<string | "back" | undefined> {
+    if ((ctx as ExtensionContext & { mode?: string }).mode !== "tui") {
+      const result = await ctx.ui.select(title, options);
+      return result ?? (canGoBack ? "back" : undefined);
+    }
+
+    const result = await ctx.ui.custom<string | "back" | null>(
+      (tui, theme, _keybindings, done) => {
+        const container = new Container();
+        container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+        container.addChild(new Text(theme.fg("accent", theme.bold(title)), 1, 0));
+        container.addChild(new Spacer(1));
+
+        const items: SelectItem[] = options.map((label, index) => ({
+          value: String(index),
+          label,
+        }));
+        const list = new SelectList(items, Math.min(items.length, 12), {
+          selectedPrefix: (text: string) => theme.fg("accent", text),
+          selectedText: (text: string) => theme.bold(text),
+          description: (text: string) => theme.fg("muted", text),
+          scrollInfo: (text: string) => theme.fg("dim", text),
+          noMatch: (text: string) => theme.fg("warning", text),
+        });
+        list.onSelect = (item) => done(item.value);
+        list.onCancel = () => done(canGoBack ? "back" : null);
+        container.addChild(list);
+        container.addChild(new Spacer(1));
+        const backHint = canGoBack ? "esc/h back" : "esc/h close";
+        container.addChild(
+          new Text(theme.fg("dim", `↑↓/jk navigate • enter/l select • ${backHint}`), 1, 0),
+        );
+        container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+
+        return {
+          render: (width: number) => container.render(width),
+          invalidate: () => container.invalidate(),
+          handleInput(data: string) {
+            if (matchesKey(data, Key.escape) || data === "h") {
+              done(canGoBack ? "back" : null);
+              return;
+            }
+            const listInput =
+              data === "j" ? "\x1b[B" : data === "k" ? "\x1b[A" : data === "l" ? "\r" : data;
+            list.handleInput(listInput);
+            tui.requestRender();
+          },
+        };
+      },
+      {
+        overlay: true,
+        overlayOptions: {
+          anchor: "center",
+          width: "60%",
+          minWidth: 50,
+          maxHeight: "80%",
+          margin: { top: 2, bottom: 2 },
+        },
+      },
+    );
+
+    if (result === null) return undefined;
+    if (result === "back") return result;
+    return options[Number(result)];
+  }
+
   async function selectMutation(
     block: FileMutation[],
     ctx: ExtensionContext,
     showEarlierTurns: boolean,
-  ): Promise<OpenTarget | "earlier" | null> {
+    canGoBack: boolean,
+  ): Promise<OpenTarget | "earlier" | "back" | null> {
     const byFile = new Map<string, FileMutation[]>();
     for (const mutation of block) {
       const history = byFile.get(mutation.path) ?? [];
@@ -476,38 +561,46 @@ export default function (pi: ExtensionAPI) {
     });
     const earlierTurnsLabel = ctx.ui.theme.fg("muted", "Show edits from earlier turns…");
     const choices = showEarlierTurns ? [...fileLabels, earlierTurnsLabel] : fileLabels;
-    const selectedFile = await ctx.ui.select("Open Pi-edited file:", choices);
-    if (!selectedFile) return null;
-    if (selectedFile === earlierTurnsLabel) return "earlier";
-    const [selectedPath, history] = files[fileLabels.indexOf(selectedFile)];
 
-    const newestFirst = [...history].reverse();
-    if (newestFirst.length === 1) {
-      return { path: selectedPath, line: newestFirst[0].ranges[0]?.startLine };
+    while (true) {
+      const selectedFile = await selectPopup("Open Pi-edited file:", choices, ctx, canGoBack);
+      if (!selectedFile) return null;
+      if (selectedFile === "back") return "back";
+      if (selectedFile === earlierTurnsLabel) return "earlier";
+      const [selectedPath, history] = files[fileLabels.indexOf(selectedFile)];
+
+      const newestFirst = [...history].reverse();
+      if (newestFirst.length === 1) {
+        return { path: selectedPath, line: newestFirst[0].ranges[0]?.startLine };
+      }
+
+      const editLabels = newestFirst.map((mutation, index) => {
+        const range = mutation.ranges[0];
+        const location = range
+          ? range.startLine === range.endLine
+            ? `line ${range.startLine}`
+            : `lines ${range.startLine}-${range.endLine}`
+          : "location unavailable";
+        const moreRanges =
+          mutation.ranges.length > 1 ? ` + ${mutation.ranges.length - 1} more` : "";
+        const number = ctx.ui.theme.fg("muted", `${index + 1}.`);
+        const tool = ctx.ui.theme.fg("accent", mutation.toolName);
+        const additions = ctx.ui.theme.fg("success", `+${mutation.added}`);
+        const removals = ctx.ui.theme.fg("error", `-${mutation.removed}`);
+        const time = ctx.ui.theme.fg("dim", formatRelativeTime(mutation.timestamp));
+        return `${number} ${tool} · ${location}${moreRanges} · ${additions} ${removals} · ${time}`;
+      });
+      const selectedEdit = await selectPopup(
+        `Open edit in ${path.relative(cwd, selectedPath)}:`,
+        editLabels,
+        ctx,
+        true,
+      );
+      if (!selectedEdit) return null;
+      if (selectedEdit === "back") continue;
+      const mutation = newestFirst[editLabels.indexOf(selectedEdit)];
+      return { path: selectedPath, line: mutation.ranges[0]?.startLine };
     }
-
-    const editLabels = newestFirst.map((mutation, index) => {
-      const range = mutation.ranges[0];
-      const location = range
-        ? range.startLine === range.endLine
-          ? `line ${range.startLine}`
-          : `lines ${range.startLine}-${range.endLine}`
-        : "location unavailable";
-      const moreRanges = mutation.ranges.length > 1 ? ` + ${mutation.ranges.length - 1} more` : "";
-      const number = ctx.ui.theme.fg("muted", `${index + 1}.`);
-      const tool = ctx.ui.theme.fg("accent", mutation.toolName);
-      const additions = ctx.ui.theme.fg("success", `+${mutation.added}`);
-      const removals = ctx.ui.theme.fg("error", `-${mutation.removed}`);
-      const time = ctx.ui.theme.fg("dim", formatRelativeTime(mutation.timestamp));
-      return `${number} ${tool} · ${location}${moreRanges} · ${additions} ${removals} · ${time}`;
-    });
-    const selectedEdit = await ctx.ui.select(
-      `Open edit in ${path.relative(cwd, selectedPath)}:`,
-      editLabels,
-    );
-    if (!selectedEdit) return null;
-    const mutation = newestFirst[editLabels.indexOf(selectedEdit)];
-    return { path: selectedPath, line: mutation.ranges[0]?.startLine };
   }
 
   const openInLinkedNvim = async (args: string, ctx: ExtensionContext) => {
@@ -528,29 +621,52 @@ export default function (pi: ExtensionAPI) {
         blocks.set(mutation.turnId, block);
       }
       const newestFirst = [...blocks.values()].reverse();
-      const selection = await selectMutation(newestFirst[0], ctx, newestFirst.length > 1);
-      if (selection !== "earlier") target = selection;
+      const earlierBlocks = newestFirst.slice(1);
+      const blockLabels = earlierBlocks.map((block, index) => {
+        const latest = block[block.length - 1];
+        const files = new Set(block.map((mutation) => mutation.path)).size;
+        return `${index + 1}. ${block.length} edit${block.length === 1 ? "" : "s"} in ${files} file${files === 1 ? "" : "s"} · ${formatRelativeTime(latest.timestamp)}`;
+      });
 
-      if (selection === "earlier") {
-        const earlierBlocks = newestFirst.slice(1);
-        const blockLabels = earlierBlocks.map((block, index) => {
-          const latest = block[block.length - 1];
-          const files = new Set(block.map((mutation) => mutation.path)).size;
-          return `${index + 1}. ${block.length} edit${block.length === 1 ? "" : "s"} in ${files} file${files === 1 ? "" : "s"} · ${formatRelativeTime(latest.timestamp)}`;
-        });
-        const selectedBlock = await ctx.ui.select(
+      let view: "latest" | "turns" = "latest";
+      while (!target) {
+        if (view === "latest") {
+          const selection = await selectMutation(
+            newestFirst[0],
+            ctx,
+            earlierBlocks.length > 0,
+            false,
+          );
+          if (!selection || selection === "back") return;
+          if (selection === "earlier") {
+            view = "turns";
+            continue;
+          }
+          target = selection;
+          continue;
+        }
+
+        const selectedBlock = await selectPopup(
           "Show edits from which earlier turn?",
           blockLabels,
+          ctx,
+          true,
         );
         if (!selectedBlock) return;
+        if (selectedBlock === "back") {
+          view = "latest";
+          continue;
+        }
         const earlierSelection = await selectMutation(
           earlierBlocks[blockLabels.indexOf(selectedBlock)],
           ctx,
           false,
+          true,
         );
-        target = earlierSelection === "earlier" ? null : earlierSelection;
+        if (!earlierSelection) return;
+        if (earlierSelection === "back") continue;
+        if (earlierSelection !== "earlier") target = earlierSelection;
       }
-      if (!target) return;
     }
     await openInNvim(target, ctx);
   };
