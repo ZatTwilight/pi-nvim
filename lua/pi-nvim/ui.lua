@@ -114,6 +114,7 @@ function M.open(opts)
   })
   vim.wo[input_win].winhl = "NormalFloat:Normal,FloatBorder:PiNvimBorder,FloatTitle:PiNvimTitle"
   vim.wo[input_win].wrap = true
+  vim.wo[input_win].linebreak = true
 
   -- Resize the input window to fit content (1..max_input_height rows)
   local function resize_input()
